@@ -41,7 +41,8 @@ struct ParsedCommand{
 
 void Splitcmd(char *command_line, CommandTable &command_table);
 void ParseCommand(CommandTable command_table, int &operation, int &count, int &index, ParsedCommand &command_list);
-void Execute(ParsedCommand command_list, int operation);
+void ChildHandler(int signo);
+void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &pid_length);
 
 
 int main(int argc , char *argv[]){
@@ -58,8 +59,13 @@ int main(int argc , char *argv[]){
         CommandTable command_table;
         command_table.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
         int index = 0; //當下預執行的 指令、process
+
+        pid_t pid_table[MAX_CMD_NUM];
+        int pid_length = 0;
+
         Splitcmd(command_line,command_table);
 
+        //將 command buffer 內的都執行完成
         while(index < command_table.length){
             int operation = NONE;
             int count = 0; //抓出 numberpipe 的數字
@@ -69,7 +75,7 @@ int main(int argc , char *argv[]){
 
             //cout<<"1----"<<endl;
 
-            Execute(command_list, operation);
+            Execute(command_list, operation, pid_table, pid_length);
 
             //cout<<"";
 
@@ -83,11 +89,11 @@ int main(int argc , char *argv[]){
 //將輸入 command_line ，做切割，丟進 command_table 這個 buffer
 void Splitcmd(char *command_line, CommandTable &command_table) {
     char delim[] = " ";
-    char *pch = strtok(command_line, delim);
+    char *temp = strtok(command_line, delim);
 
-    while (pch != NULL) {
-        command_table.commands[command_table.length++] = pch;
-        pch = strtok(NULL, delim);
+    while (temp != NULL) {
+        command_table.commands[command_table.length++] = temp;
+        temp = strtok(NULL, delim);
     }
 } 
 
@@ -129,11 +135,19 @@ void ParseCommand(CommandTable command_table, int &operation, int &count, int &i
 
     //??
     index++;
-    command_list.argv[command_list.length] = NULL; //若是後面沒東東，上面else 還有將length＋1，因此需要null擋住
+    command_list.argv[command_list.length] = NULL; //需要null，是因為執行 execvp 指令其帶有 command 參數之結尾需有 NULL
+}
+
+void ChildHandler(int signo) {
+    // polling to wait child process, WNOHANG indicate with no hang
+    int status;
+    while (waitpid(-1, &status, WNOHANG) > 0) {
+
+    }
 }
 
 // 先確定 operation 是否上下正確
-void Execute(ParsedCommand command_list, int operation){
+void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &pid_length){
     if (!strcmp(command_list.argv[0], "exit")) {
         exit(0);
     } 
@@ -146,66 +160,88 @@ void Execute(ParsedCommand command_list, int operation){
             cout << msg << endl;
         }
     } 
-    else{
-        return;
-    }
-    /*
-    else {
-        // ChildHandler get the zombie process
-        signal(SIGCHLD, ChildHandler);
-        pid_t pid;
+    else //unknown 與 一般指令 還須作判斷
+    {
+        
+        bool is_unknown = true;
 
-        pid = fork();
-        // repeat until seccessful fork
-        while (pid < 0) {
-            int status;
-            waitpid(-1, &status, 0);
-            pid = fork();
+        char *env = getenv("PATH");
+        char myenv[MAX_CMD_LEN];
+        strcpy(myenv, env);
+        char delim[] = ":";
+        char *pch = strtok(myenv, delim);
+        char command_path[MAX_CMD_LEN];
+
+        while (pch != NULL) {
+            strcpy(command_path, pch);
+            FILE *fp = fopen(strcat(strcat(command_path, "/"), command_list.argv[0]), "r");
+            if (fp) {
+                fclose(fp);
+                is_unknown = false;
+                break;
+            }
+            pch = strtok(NULL, delim);
         }
-        if (pid == 0) {
-            if (inputfd != STDIN_FILENO) {
-                dup2(inputfd, STDIN_FILENO);
-            }
-            if (outputfd != STDOUT_FILENO) {
-                dup2(outputfd, STDOUT_FILENO);
-            }
-            if (errorfd != STDERR_FILENO) {
-                dup2(errorfd, STDERR_FILENO);
+
+        if(is_unknown){
+            cerr << "Unknown command: [" << command_list.argv[0] << "]." << endl;
+        }
+        else // 確認完，為可執行的指令，i.e. 執行檔有放在 /bin 內，再去做 fork()才比較省。
+        {
+            // 只有 parent 會做持續檢查，遇到 pipe ，會再次回來執行 execute 就會持續檢查有無 zombie 了。
+            signal(SIGCHLD, ChildHandler);
+            pid_t pid = fork();
+
+            // 生出一個正確的 child
+            while (pid < 0) {
+                int status;
+                waitpid(-1, &status, 0);
+                pid = fork();
             }
 
-            if (inputfd != STDIN_FILENO) {
-                close(inputfd);
-            }
-            if (outputfd != STDOUT_FILENO) {
-                close(outputfd);
-            }
-            if (errorfd != STDERR_FILENO) {
-                close(errorfd);
-            }
-
-            if (!strcmp(command_list.argv[0], "")) {
-                cerr << "Unknown command: [" << command_list.argv[0] << "]." << endl;
-            } else {
-                execvp(command_list.argv[0], command_list.argv);
-            }
-
-            exit(0);
-        } 
-        else {
-            if (op == NONE || op == FILE_REDIRECTION) {
-                pid_table[pid_length++] = pid;
-                for (int i = 0; i < pid_length; ++i) {
-                    int status;
-                    waitpid(pid_table[i], &status, 0);
+            // pid == 0 是子程序，大於 0 則是父程序收到的子程序process id
+            if (pid == 0) {
+                /*
+                if (inputfd != STDIN_FILENO) {
+                    dup2(inputfd, STDIN_FILENO);
                 }
-                if (op == FILE_REDIRECTION) {
+                if (outputfd != STDOUT_FILENO) {
+                    dup2(outputfd, STDOUT_FILENO);
+                }
+                if (errorfd != STDERR_FILENO) {
+                    dup2(errorfd, STDERR_FILENO);
+                }
+
+                if (inputfd != STDIN_FILENO) {
+                    close(inputfd);
+                }
+                if (outputfd != STDOUT_FILENO) {
                     close(outputfd);
                 }
-            } else {
+                if (errorfd != STDERR_FILENO) {
+                    close(errorfd);
+                }
+                */
+
+                execvp(command_list.argv[0], command_list.argv);
+                exit(0);
+            } 
+            else {
                 pid_table[pid_length++] = pid;
+                if (operation == NONE || operation == FILE_REDIRECTION) // 指令後面沒有遇到 pipe，p.s.根據 spec，> 之後不會有 pipe，因此必定是最後程序
+                {
+                    for (int i = 0; i < pid_length; ++i) {
+                        int status;
+                        waitpid(pid_table[i], &status, 0);
+                    }
+                    if (operation == FILE_REDIRECTION) //?? fd 還未解決
+                    {
+                        ;//close(outputfd);
+                    }
+                } 
+                // 遇到 pipe ，父程序就先不用等“當下”這個子process處理完，因為還有後面幾個也要執行。
             }
         }
     }
-    */
 }
 
