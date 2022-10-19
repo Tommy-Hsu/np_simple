@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <string>
 #include <cstring>
+#include <fstream>
 using namespace std;
 
 #define MAX_LINE_LEN 15001
@@ -77,6 +78,9 @@ int main(int argc , char *argv[]){
         if (!cin.getline(command_line, sizeof(command_line))) {
             break;
         }
+        //else if(cin.getline())
+        if(command_line[0] == '\0')
+            continue;
 
         CommandTable command_table;
         command_table.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
@@ -88,14 +92,21 @@ int main(int argc , char *argv[]){
         CountdownPipefd(pipefd, pipe_amount);
         Splitcmd(command_line,command_table);
 
+        int last_operation = NONE;
+
         //將 command buffer 內的都執行完成
         while(index < command_table.length){
             int operation = NONE;
+
             int count = 0; //抓出 numberpipe 的數字
             ParsedCommand command_list;
 
             ParseCommand(command_table, operation, count, index, command_list);
-            
+
+            if(last_operation == NUMBER_PIPE || last_operation == NUMBER_PIPE_ERR)
+                CountdownPipefd(pipefd, pipe_amount);//如果 number pipe 不在句尾，在count 一次
+            last_operation = operation;
+
             //在 execute 之前就需要設定好整個 process 的 fd
             int inputfd = GetInputfd(pipefd, pipe_amount); 
             int outputfd = GetOutputfd(pipefd, pipe_amount, operation, count, command_list);
@@ -104,8 +115,10 @@ int main(int argc , char *argv[]){
             Execute(command_list, operation, pid_table, pid_length, inputfd, outputfd, errorfd);            
             ClosePipefd(pipefd, pipe_amount);
 
-        }
+            cout<<"";
 
+        }
+        last_operation = NONE;
     }
 
     return 0;
@@ -125,6 +138,7 @@ void Splitcmd(char *command_line, CommandTable &command_table) {
 } 
 
 void CountdownPipefd(Pipefd_table pipefd[], const int pipe_amount) {
+
     for (int i = 0; i < pipe_amount; ++i) {
         pipefd[i].count -= 1;
     }
@@ -296,10 +310,10 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
 
         while (pch != NULL) {
             strcpy(command_path, pch);
-            //cout<<command_path<<endl;
-            FILE *fp = fopen(strcat(strcat(command_path, "/"), command_list.argv[0]), "r");
+            strcat(command_path, "/");
+            strcat(command_path, command_list.argv[0]);
+            FILE *fp = fopen(command_path, "r");
             if (fp) {
-                //cout<<fp<<endl;
                 fclose(fp);
                 is_unknown = false;
                 break;
@@ -328,27 +342,24 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
             // 子程序之
             if (pid == 0) {
                 
-                if (inputfd != STDIN_FILENO) {
-                    dup2(inputfd, STDIN_FILENO);
-                }
-                if (outputfd != STDOUT_FILENO) {
-                    dup2(outputfd, STDOUT_FILENO);
-                }
-                if (errorfd != STDERR_FILENO) {
-                    dup2(errorfd, STDERR_FILENO);
-                }
+                //if (inputfd != STDIN_FILENO) {
+                int x = dup2(inputfd, STDIN_FILENO); //會執行任務且會回傳東西，
+                //}
+                //if (outputfd != STDOUT_FILENO) {
+                int y = dup2(outputfd, STDOUT_FILENO);
+                //}
+                //if (errorfd != STDERR_FILENO) {
+                int z = dup2(errorfd, STDERR_FILENO);
+                //}
 
-                if (inputfd != STDIN_FILENO) {
+                if (inputfd != STDIN_FILENO)
                     close(inputfd);
-                }
-                if (outputfd != STDOUT_FILENO) {
+                if (outputfd != STDOUT_FILENO)
                     close(outputfd);
-                }
-                if (errorfd != STDERR_FILENO) {
+                if (errorfd != STDERR_FILENO)
                     close(errorfd);
-                }
 
-                execvp(command_list.argv[0], command_list.argv);
+                execvp(command_path, command_list.argv);
                 exit(0);
             } 
             else {
