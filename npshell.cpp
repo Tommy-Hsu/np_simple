@@ -7,6 +7,9 @@
 #include <string>
 #include <cstring>
 #include <fstream>
+
+#include <pwd.h> //demo 1 log all the commands to ~/.npshell_history
+
 using namespace std;
 
 #define MAX_LINE_LEN 15001
@@ -68,11 +71,17 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
 
 void CountdownPipefd(Pipefd_table pipefd[], const int pipe_amount);
 
+std::string home_dir(){
+    return getpwuid(getuid())->pw_dir;
+}
+
 int main(int argc , char *argv[]){
 
     setenv("PATH", "bin:.", 1); //設定process之環境變數
     int pipe_amount = 0; //紀錄存在多少 pipe 的數量
     Pipefd_table pipefd[MAX_PIPE_NUM]; //紀錄每個 pipe 的資訊
+    fstream file;
+    file.open(home_dir()+"/.npshell_history.txt",ios::out);
 
     while (1){
 
@@ -83,6 +92,13 @@ int main(int argc , char *argv[]){
         }
         if(command_line[0] == '\0')
             continue;
+
+        if(file){
+            //cout<<"success"<<endl;
+            string temp_com = command_line;
+            file<<temp_com<<endl;
+        }
+        
 
         CommandBuffer command_buffer;
         command_buffer.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
@@ -121,6 +137,7 @@ int main(int argc , char *argv[]){
         }
     }
 
+    file.close();
     return 0;
 
 }
