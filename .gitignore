@@ -1,6 +1,4 @@
 .forward
-.gitignore
-.gitignore.swp
 .history
 .pki
 .ssh
