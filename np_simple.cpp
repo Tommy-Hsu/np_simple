@@ -5,10 +5,11 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <string>
+#include <string.h>
 #include <cstring>
 #include <fstream>
-
-#include <pwd.h> //demo 1 log all the commands to ~/.npshell_history
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 using namespace std;
 
@@ -18,6 +19,8 @@ using namespace std;
 #define MAX_ARGV_LEN 256
 #define MAX_PIPE_NUM 200
 #define MAX_FILENAME_LEN 1000
+#define ENV_NUM 100
+#define ENV_LEN 500
 
 const int NONE = 1;
 const int ORDINARY_PIPE = 2;
@@ -37,6 +40,8 @@ struct CommandBuffer {
 struct ParsedCommand{
 
     int length = 0; // pipe 之前有多少指令
+    int operation = NONE; //現在這條輸入，屬於何種指令型態
+    int count = 0; //抓出 numberpipe 的數字
     char *argv[MAX_ARGV_LEN]; // 指令與變數
     char filename[MAX_FILENAME_LEN]; //後面某些為 filename
 
@@ -57,32 +62,172 @@ struct Pipefd_table {
 
 };
 
-void Splitcmd(char *command_line, CommandBuffer &command_buffer);
-void ParseCommand(CommandBuffer command_buffer, int &operation, int &count, int &index, ParsedCommand &command_list);
+struct EnvTable {
+    char key[ENV_NUM][ENV_LEN];
+    char value[ENV_NUM][ENV_LEN];
+    int length;
+};
+
+int TCP_establish(uint16_t port);
+
+void Splitcmd(char *input, CommandBuffer &command_buffer);
+void ParseCommand(CommandBuffer command_buffer, int &index, ParsedCommand &command_list);
 
 void CreatePipefd(Pipefd_table pipefd[], int &pipe_amount, int count, bool to_next);
 void ClosePipefd(Pipefd_table pipefd[], int &pipe_amount);
+void Get_StdIOfd(Pipefd_table pipefd[], int &pipe_amount, int cli_sockfd, ParsedCommand command_list, int stdIOfd[]);
+/*
 int GetInputfd(Pipefd_table pipefd[], int pipe_amount);
 int GetOutputfd(Pipefd_table pipefd[], int &pipe_amount, int operation, int count, ParsedCommand command_list);
 int GetErrorfd(Pipefd_table pipefd[], int &pipe_amount, int operation, int count);
+*/
 
 void ChildHandler(int signo);
-void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &pid_length, int inputfd, int outputfd, int errorfd);
+void Exe_cmd(ParsedCommand command_list, pid_t pid_table[], int &pid_length, int stdIOfd[], int cli_sockfd, EnvTable &env);
 
 void CountdownPipefd(Pipefd_table pipefd[], const int pipe_amount);
 
-std::string home_dir(){
-    return getpwuid(getuid())->pw_dir;
+void Exe_server(int cli_sockfd, EnvTable &env);
+
+int main(int argc, char *argv[]){
+    setenv("PATH", "bin:.", 1); //設定process之環境變數
+    if (argc != 2) {
+        cerr << "./np_simple [port]" << endl;
+        exit(1);
+    }
+
+    int ser_sockfd;
+    int cli_sockfd;
+    int port = atoi(argv[1]);
+    sockaddr_in cli_addr;
+    socklen_t cli_addr_len;
+
+    ser_sockfd = TCP_establish(port);
+
+    while(true){
+
+        cli_addr_len = sizeof(cli_addr);
+        cli_sockfd = accept(ser_sockfd, (sockaddr *) &cli_addr, &cli_addr_len);
+        if (cli_sockfd < 0) {
+            cerr << "Error: accept failed" << endl;
+            continue;
+        }
+
+        EnvTable env = {
+            .length = 0
+        };
+        strcpy(env.key[env.length], "PATH");
+        strcpy(env.value[env.length], "bin:.");
+        env.length++;
+
+        Exe_server(cli_sockfd, env);
+        close(cli_sockfd);
+    }
+    close(ser_sockfd);
+    cout<<"---------you type [Ctrl^c] to shutdown the server----------"<<endl;
+
+    return 0;
 }
 
-int main(int argc , char *argv[]){
+int TCP_establish(uint16_t port){
+    int ser_sockfd;
+    int enable = 1;
+    sockaddr_in ser_addr{};//memset((char *) &ser_addr, 0, sizeof(ser_addr));
 
-    setenv("PATH", "bin:.", 1); //設定process之環境變數
+    ser_sockfd = socket(AF_INET, SOCK_STREAM, 0); //選擇 ipv4, 並使用 tcp 連線，選擇 0 自動選擇對應協議
+    if (ser_sockfd < 0) {
+        cerr << "Error: socket failed" << endl;
+        exit(1);
+    }
+
+    ser_addr.sin_family = PF_INET; //PF_INET=AF_INET
+    ser_addr.sin_addr.s_addr = INADDR_ANY;
+    ser_addr.sin_port = htons(port);
+
+    if (setsockopt(ser_sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) //設定 socket
+    {
+        cerr << "Error: setsockopt failed" << endl;
+        exit(1);
+    }
+    if (bind(ser_sockfd, (sockaddr *)&ser_addr, sizeof(ser_addr)) < 0) 
+    {
+        cerr << "Error: bind failed" << endl;
+        exit(1);
+    }
+    if (listen(ser_sockfd, 0) < 0) 
+    {
+        cerr << "Error: listen failed" << endl;
+        exit(1);
+    }
+
+    return ser_sockfd;
+}
+
+void Exe_server(int cli_sockfd, EnvTable &env){
+
     int pipe_amount = 0; //紀錄存在多少 pipe 的數量
     Pipefd_table pipefd[MAX_PIPE_NUM]; //紀錄每個 pipe 的資訊
-    fstream file;
-    file.open(home_dir()+"/.npshell_history.txt",ios::out);
 
+    while(true){
+
+        char read_buffer[MAX_LINE_LEN]={};
+        CommandBuffer command_buffer;
+        command_buffer.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
+        int index = 0; // 當作觀察整行指令，後面包含哪些符號，再去判定這行該如何執行
+        pid_t pid_table[MAX_CMD_NUM];
+        int pid_length = 0;
+
+        write(cli_sockfd,"% ",strlen("% "));
+        do {
+            read(cli_sockfd, read_buffer, sizeof(read_buffer));
+            if(!strcmp(read_buffer,"exit\r\n"))
+                return;
+            if(!strcmp(read_buffer,"\r\n"))
+                continue;
+        } while (read_buffer[strlen(read_buffer) - 1] != '\n');
+
+        CountdownPipefd(pipefd, pipe_amount);
+        char input[MAX_LINE_LEN]={};
+        strcat(input, read_buffer);
+        strtok(input, "\r\n");
+        Splitcmd(input,command_buffer);
+
+        int last_operation = NONE;
+
+        //將 command buffer 內的都執行完成
+        while(index < command_buffer.length){
+
+            ParsedCommand command_list;
+            ParseCommand(command_buffer, index, command_list);
+
+            if(last_operation == NUMBER_PIPE || last_operation == NUMBER_PIPE_ERR)
+                CountdownPipefd(pipefd, pipe_amount);//如果 number pipe 不在句尾，在count 一次
+            last_operation = command_list.operation;
+
+            /*
+            //在 execute 之前就需要設定好整個 process 的 fd
+            int inputfd = GetInputfd(pipefd, pipe_amount); 
+            int outputfd = GetOutputfd(pipefd, pipe_amount, operation, count, command_list);
+            int errorfd = GetErrorfd(pipefd, pipe_amount, operation, count);
+            */
+
+            int stdIOfd[3]={};
+            Get_StdIOfd(pipefd, pipe_amount, cli_sockfd, command_list, stdIOfd);
+            Exe_cmd(command_list, pid_table, pid_length, stdIOfd, cli_sockfd, env);            
+            ClosePipefd(pipefd, pipe_amount); //close pipe 父程序才需要，因為子程序早就 exit 了
+
+        }
+
+    }
+
+}
+
+/*
+void exe_server(int cli_sockfd){
+
+    int pipe_amount = 0; //紀錄存在多少 pipe 的數量
+    Pipefd_table pipefd[MAX_PIPE_NUM]; //紀錄每個 pipe 的資訊
+    
     while (1){
 
         cout << "% ";
@@ -92,14 +237,7 @@ int main(int argc , char *argv[]){
         }
         if(command_line[0] == '\0')
             continue;
-
-        if(file){
-            //cout<<"success"<<endl;
-            string temp_com = command_line;
-            file<<temp_com<<endl;
-        }
         
-
         CommandBuffer command_buffer;
         command_buffer.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
         int index = 0; // 當作觀察整行指令，後面包含哪些符號，再去判定這行該如何執行
@@ -136,19 +274,14 @@ int main(int argc , char *argv[]){
 
         }
     }
-
-    file.close();
-    return 0;
-
 }
+*/
 
-
-
-//將輸入 command_line ，做切割，丟進 command_buffer 這個 buffer
-void Splitcmd(char *command_line, CommandBuffer &command_buffer) {
+//將輸入 input ，做切割，丟進 command_buffer 這個 buffer
+void Splitcmd(char *input, CommandBuffer &command_buffer) {
     
     char delim[] = " ";
-    char *temp = strtok(command_line, delim);
+    char *temp = strtok(input, delim);
 
     while (temp != NULL) {
 
@@ -171,9 +304,8 @@ void CountdownPipefd(Pipefd_table pipefd[], const int pipe_amount) {
 // 遇到 pipe 或其他符號，視為轉換到另一個 process，
 // 因此須先把當下的 process 處理完成。
 // 也就是如 removetag test.html | number 會在 | 的地方停住
-void ParseCommand(CommandBuffer command_buffer, int &operation, int &count, int &index, ParsedCommand &command_list){
+void ParseCommand(CommandBuffer command_buffer, int &index, ParsedCommand &command_list){
 
-    command_list.length = 0;
     command_list.argv[command_list.length++] = command_buffer.commands[index++]; //第一個字串必定是命令，而命令必會為 argv[0]
 
     while (index < command_buffer.length) {
@@ -182,28 +314,28 @@ void ParseCommand(CommandBuffer command_buffer, int &operation, int &count, int 
 
             if (command_buffer.commands[index][1] != '\0') {
 
-                operation = NUMBER_PIPE;
-                count = atoi(&command_buffer.commands[index][1]);
+                command_list.operation = NUMBER_PIPE;
+                command_list.count = atoi(&command_buffer.commands[index][1]);
                 break;
 
             } else {
 
-                operation = ORDINARY_PIPE;
-                count = 0;
+                command_list.operation = ORDINARY_PIPE;
+                command_list.count = 0;
                 break;
 
             }
         } //numberpipe 數字與槓會是相連的，因此字符會有非結尾
         else if (command_buffer.commands[index][0] == '!') {
 
-            operation = NUMBER_PIPE_ERR;
-            count = atoi(&command_buffer.commands[index][1]);
+            command_list.operation = NUMBER_PIPE_ERR;
+            command_list.count = atoi(&command_buffer.commands[index][1]);
             break;
 
         } 
         else if (command_buffer.commands[index][0] == '>') {
 
-            operation = FILE_REDIRECTION;
+            command_list.operation = FILE_REDIRECTION;
             strcpy(command_list.filename, command_buffer.commands[++index]); //將file資訊存到屬於filename那邊
             break;
 
@@ -220,10 +352,10 @@ void ParseCommand(CommandBuffer command_buffer, int &operation, int &count, int 
 
 }
 
-void CreatePipefd(Pipefd_table pipefd[], int &pipe_amount, int count, bool to_next) {
+void CreatePipefd(Pipefd_table pipefd[], int &pipe_amount, ParsedCommand command_list, bool to_next) {
 
     pipe(pipefd[pipe_amount].fd); //根據 pipe()，system 會將其 fd 幫你寫入你填入的 array
-    pipefd[pipe_amount].count = count; //若是 number pipe 則用做倒數。
+    pipefd[pipe_amount].count = command_list.count; //若是 number pipe 則用做倒數。
     pipefd[pipe_amount].to_next = to_next;
     pipe_amount++;
 
@@ -238,20 +370,14 @@ void ClosePipefd(Pipefd_table pipefd[], int &pipe_amount) {
         {
 
             close(pipefd[i].fd[0]);
-            pipefd[i].fd[0] = -1; //fd 為負值，代表 no value
 
-            pipe_amount--;
+            pipe_amount-=1;
 
-            if (pipe_amount > 0)  //若後面還有 num pipe 要等，pipe_amount 直接砍會不見，所以要把人家往前移(至少最後一個要)
-            {
+            Pipefd_table temp = pipefd[pipe_amount];
+            pipefd[pipe_amount] = pipefd[i];
+            pipefd[i] = temp;
 
-                Pipefd_table temp = pipefd[pipe_amount];
-                pipefd[pipe_amount] = pipefd[i];
-                pipefd[i] = temp;
-
-            }
-
-            i--;
+            i-=1;
 
         } 
         else if (pipefd[i].to_next == true) // ord pipe
@@ -263,6 +389,80 @@ void ClosePipefd(Pipefd_table pipefd[], int &pipe_amount) {
     }
 }
 
+void Get_StdIOfd(Pipefd_table pipefd[], int &pipe_amount, int cli_sockfd, ParsedCommand command_list, int stdIOfd[]){
+    
+    stdIOfd[0] =  STDIN_FILENO; //對 ordinary pipe 而言，因為與前面指令一起看，i.e. ls | 所以當然其 stdin 仍為 STDIN_FILENO
+    for (int i = 0; i < pipe_amount; ++i) {
+
+        // 遇到到期的 pipe 就要去解決，包括 ordinary pipe;。
+        if (pipefd[i].count == 0) {
+
+            close(pipefd[i].fd[1]);
+            pipefd[i].fd[1] = -1;
+
+            stdIOfd[0] = pipefd[i].fd[0];
+            break;
+        }
+    }
+
+    stdIOfd[1] = cli_sockfd;
+    bool find = false;
+    if (command_list.operation == NUMBER_PIPE || command_list.operation == NUMBER_PIPE_ERR) 
+    {
+
+        for (int i = 0; i < pipe_amount; ++i) {
+
+            if (pipefd[i].count == command_list.count) {
+
+                stdIOfd[1] = pipefd[i].fd[1];
+                find = true;
+                break;
+            }
+        }
+
+        if(!find){
+            CreatePipefd(pipefd, pipe_amount, command_list, false);
+            stdIOfd[1] =  pipefd[pipe_amount - 1].fd[1];
+        }
+    } 
+    else if (command_list.operation == ORDINARY_PIPE) 
+    {
+
+        CreatePipefd(pipefd, pipe_amount, command_list, true);
+        stdIOfd[1] =  pipefd[pipe_amount - 1].fd[1]; //pipe 的左端(寫入pipe那端)，是pipe的尾巴。
+
+    } 
+    else if (command_list.operation == FILE_REDIRECTION) 
+    {
+
+        stdIOfd[1] = open(command_list.filename, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+        //檔案需要有 r 權限 與 x 權限
+
+    }
+
+    stdIOfd[2] = cli_sockfd;
+    find = false;
+    if (command_list.operation == NUMBER_PIPE_ERR) {
+
+        for (int i = 0; i < pipe_amount; ++i) {
+
+            if (pipefd[i].count == command_list.count) {
+
+                stdIOfd[2] =  pipefd[i].fd[1];
+                find = true;
+                break;
+            }
+        }
+
+        if(!find){
+            CreatePipefd(pipefd, pipe_amount, command_list, false);
+            stdIOfd[2] =  pipefd[pipe_amount - 1].fd[1];
+        }
+    }
+
+}
+
+/*
 // 如果是 number pipe 才需要 close 前面的
 int GetInputfd(Pipefd_table pipefd[], int pipe_amount){
 
@@ -344,6 +544,8 @@ int GetErrorfd(Pipefd_table pipefd[], int &pipe_amount, int operation, int count
 
 }
 
+*/
+
 void ChildHandler(int signo) {
     
     // polling to wait child process, WNOHANG indicate with no hang
@@ -355,14 +557,9 @@ void ChildHandler(int signo) {
 }
 
 // 先確定 operation 是否上下正確
-void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &pid_length, int inputfd, int outputfd, int errorfd){
+void Exe_cmd(ParsedCommand command_list, pid_t pid_table[], int &pid_length, int stdIOfd[], int cli_sockfd, EnvTable &env){
     
-    if (!strcmp(command_list.argv[0], "exit")) {
-
-        exit(0);
-
-    } 
-    else if (!strcmp(command_list.argv[0], "setenv")) {
+    if (!strcmp(command_list.argv[0], "setenv")) {
 
         setenv(command_list.argv[1], command_list.argv[2], 1);
 
@@ -370,9 +567,11 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
     else if (!strcmp(command_list.argv[0], "printenv")) {
 
         char *msg = getenv(command_list.argv[1]);
+        char output[3000];
+        sprintf(output, "%s\n", msg);
         if (msg) {
 
-            cout << msg << endl;
+           write(stdIOfd[1], output, strlen(output));
 
         }
 
@@ -381,9 +580,8 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
     {
         
         bool is_unknown = true;
-        char *env = getenv("PATH");
         char myenv[MAX_CMD_LEN];
-        strcpy(myenv, env);
+        strcpy(myenv, env.value[0]);
         char delim[] = ":";
         char *pch = strtok(myenv, delim);
         char command_path[MAX_CMD_LEN];
@@ -408,8 +606,13 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
         }
 
         if(is_unknown){
+            
+            char temp[MAX_CMD_LEN]={};
+            strcpy(temp,"Unknown command: [");
+            strcat(temp, command_list.argv[0]);
+            strcat(temp, "].\n");
 
-            cerr << "Unknown command: [" << command_list.argv[0] << "]." << endl;
+            write(cli_sockfd, temp, strlen(temp));
 
         }
         else // 確認完，為可執行的指令，i.e. 執行檔有放在 /bin 內，再去做 fork()才比較省。
@@ -433,24 +636,26 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
             // 子程序之
             if (pid == 0) {
                 
-                int x = dup2(inputfd, STDIN_FILENO); //會執行任務且會回傳東西，
-                int y = dup2(outputfd, STDOUT_FILENO);
-                int z = dup2(errorfd, STDERR_FILENO);
+                int x = dup2(stdIOfd[0], STDIN_FILENO); //會執行任務且會回傳東西，
+                int y = dup2(stdIOfd[1], STDOUT_FILENO);
+                int z = dup2(stdIOfd[2], STDERR_FILENO);
 
-                if (inputfd != STDIN_FILENO)
-                    close(inputfd);
-                if (outputfd != STDOUT_FILENO)
-                    close(outputfd);
-                if (errorfd != STDERR_FILENO)
-                    close(errorfd);
+                if (stdIOfd[0] != STDIN_FILENO)
+                    close(stdIOfd[0]);
+                if (stdIOfd[1] != STDOUT_FILENO)
+                    close(stdIOfd[1]);
+                if (stdIOfd[2] != STDERR_FILENO)
+                    close(stdIOfd[2]);
 
-                execvp(command_path, command_list.argv);
+                while (execvp(command_path, command_list.argv) == -1) {
+                    write(cli_sockfd, "error exec\n",strlen("error exec\n"));
+                };
                 exit(0);
             } 
             else {
 
                 pid_table[pid_length++] = pid;
-                if (operation == NONE || operation == FILE_REDIRECTION) // 指令後面沒有遇到 pipe，p.s.根據 spec，> 之後不會有 pipe，因此必定是最後程序
+                if (command_list.operation == NONE || command_list.operation == FILE_REDIRECTION) // 指令後面沒有遇到 pipe，p.s.根據 spec，> 之後不會有 pipe，因此必定是最後程序
                 {
 
                     for (int i = 0; i < pid_length; ++i) {
@@ -459,10 +664,10 @@ void Execute(ParsedCommand command_list, int operation, pid_t pid_table[], int &
                         waitpid(pid_table[i], &status, 0);
 
                     }
-                    if (operation == FILE_REDIRECTION) //已經到最終輸出了
+                    if (command_list.operation == FILE_REDIRECTION) //已經到最終輸出了
                     {
 
-                        close(outputfd);
+                        close(stdIOfd[1]);
 
                     }
                 } 
