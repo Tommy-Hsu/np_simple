@@ -69,6 +69,7 @@ struct EnvTable {
 };
 
 int TCP_establish(uint16_t port);
+bool IsBuildInCmd(CommandBuffer command_buffer, EnvTable &env, int sockfd);
 
 void Splitcmd(char *input, CommandBuffer &command_buffer);
 void ParseCommand(CommandBuffer command_buffer, int &index, ParsedCommand &command_list);
@@ -76,11 +77,6 @@ void ParseCommand(CommandBuffer command_buffer, int &index, ParsedCommand &comma
 void CreatePipefd(Pipefd_table pipefd[], int &pipe_amount, int count, bool to_next);
 void ClosePipefd(Pipefd_table pipefd[], int &pipe_amount);
 void Get_StdIOfd(Pipefd_table pipefd[], int &pipe_amount, int cli_sockfd, ParsedCommand command_list, int stdIOfd[]);
-/*
-int GetInputfd(Pipefd_table pipefd[], int pipe_amount);
-int GetOutputfd(Pipefd_table pipefd[], int &pipe_amount, int operation, int count, ParsedCommand command_list);
-int GetErrorfd(Pipefd_table pipefd[], int &pipe_amount, int operation, int count);
-*/
 
 void ChildHandler(int signo);
 void Exe_cmd(ParsedCommand command_list, pid_t pid_table[], int &pid_length, int stdIOfd[], int cli_sockfd, EnvTable &env);
@@ -144,7 +140,7 @@ int TCP_establish(uint16_t port){
     ser_addr.sin_addr.s_addr = INADDR_ANY;
     ser_addr.sin_port = htons(port);
 
-    if (setsockopt(ser_sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) //設定 socket
+    if (setsockopt(ser_sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0) //設定 socket
     {
         cerr << "Error: setsockopt failed" << endl;
         exit(1);
@@ -171,6 +167,8 @@ void Exe_server(int cli_sockfd, EnvTable &env){
     while(true){
 
         char read_buffer[MAX_LINE_LEN]={};
+        char input[MAX_LINE_LEN]={};
+
         CommandBuffer command_buffer;
         command_buffer.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
         int index = 0; // 當作觀察整行指令，後面包含哪些符號，再去判定這行該如何執行
@@ -179,17 +177,22 @@ void Exe_server(int cli_sockfd, EnvTable &env){
 
         write(cli_sockfd,"% ",strlen("% "));
         do {
+            memset(&read_buffer, '\0', sizeof(read_buffer));
             read(cli_sockfd, read_buffer, sizeof(read_buffer));
-            if(!strcmp(read_buffer,"exit\r\n"))
-                return;
-            if(!strcmp(read_buffer,"\r\n"))
-                continue;
+            strcat(input, read_buffer);
+
         } while (read_buffer[strlen(read_buffer) - 1] != '\n');
 
-        CountdownPipefd(pipefd, pipe_amount);
-        char input[MAX_LINE_LEN]={};
-        strcat(input, read_buffer);
         strtok(input, "\r\n");
+
+        if (!strcmp(input, "")) {
+            continue;
+        }
+        if (!strcmp(input, "exit")) {
+            return;
+        }
+
+        CountdownPipefd(pipefd, pipe_amount);
         Splitcmd(input,command_buffer);
 
         int last_operation = NONE;
@@ -197,24 +200,23 @@ void Exe_server(int cli_sockfd, EnvTable &env){
         //將 command buffer 內的都執行完成
         while(index < command_buffer.length){
 
-            ParsedCommand command_list;
-            ParseCommand(command_buffer, index, command_list);
+            if(!IsBuildInCmd(command_buffer, env, cli_sockfd))
+            {
+                ParsedCommand command_list;
+                ParseCommand(command_buffer, index, command_list);
 
-            if(last_operation == NUMBER_PIPE || last_operation == NUMBER_PIPE_ERR)
-                CountdownPipefd(pipefd, pipe_amount);//如果 number pipe 不在句尾，在count 一次
-            last_operation = command_list.operation;
+                if(last_operation == NUMBER_PIPE || last_operation == NUMBER_PIPE_ERR)
+                    CountdownPipefd(pipefd, pipe_amount);//如果 number pipe 不在句尾，在count 一次
+                last_operation = command_list.operation;
 
-            /*
-            //在 execute 之前就需要設定好整個 process 的 fd
-            int inputfd = GetInputfd(pipefd, pipe_amount); 
-            int outputfd = GetOutputfd(pipefd, pipe_amount, operation, count, command_list);
-            int errorfd = GetErrorfd(pipefd, pipe_amount, operation, count);
-            */
-
-            int stdIOfd[3]={};
-            Get_StdIOfd(pipefd, pipe_amount, cli_sockfd, command_list, stdIOfd);
-            Exe_cmd(command_list, pid_table, pid_length, stdIOfd, cli_sockfd, env);            
-            ClosePipefd(pipefd, pipe_amount); //close pipe 父程序才需要，因為子程序早就 exit 了
+                int stdIOfd[3]={};
+                Get_StdIOfd(pipefd, pipe_amount, cli_sockfd, command_list, stdIOfd);
+                Exe_cmd(command_list, pid_table, pid_length, stdIOfd, cli_sockfd, env);            
+                ClosePipefd(pipefd, pipe_amount); //close pipe 父程序才需要，因為子程序早就 exit 了
+            }
+            else{
+                break;
+            }
 
         }
 
@@ -222,60 +224,6 @@ void Exe_server(int cli_sockfd, EnvTable &env){
 
 }
 
-/*
-void exe_server(int cli_sockfd){
-
-    int pipe_amount = 0; //紀錄存在多少 pipe 的數量
-    Pipefd_table pipefd[MAX_PIPE_NUM]; //紀錄每個 pipe 的資訊
-    
-    while (1){
-
-        cout << "% ";
-        char command_line[MAX_LINE_LEN]={'\0'};
-        if (!cin.getline(command_line, sizeof(command_line))) {
-            break;
-        }
-        if(command_line[0] == '\0')
-            continue;
-        
-        CommandBuffer command_buffer;
-        command_buffer.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
-        int index = 0; // 當作觀察整行指令，後面包含哪些符號，再去判定這行該如何執行
-
-        pid_t pid_table[MAX_CMD_NUM];
-        int pid_length = 0;
-
-        CountdownPipefd(pipefd, pipe_amount);
-        Splitcmd(command_line,command_buffer);
-
-        int last_operation = NONE;
-
-        //將 command buffer 內的都執行完成
-        while(index < command_buffer.length){
-
-            int operation = NONE;
-
-            int count = 0; //抓出 numberpipe 的數字
-            ParsedCommand command_list;
-
-            ParseCommand(command_buffer, operation, count, index, command_list);
-
-            if(last_operation == NUMBER_PIPE || last_operation == NUMBER_PIPE_ERR)
-                CountdownPipefd(pipefd, pipe_amount);//如果 number pipe 不在句尾，在count 一次
-            last_operation = operation;
-
-            //在 execute 之前就需要設定好整個 process 的 fd
-            int inputfd = GetInputfd(pipefd, pipe_amount); 
-            int outputfd = GetOutputfd(pipefd, pipe_amount, operation, count, command_list);
-            int errorfd = GetErrorfd(pipefd, pipe_amount, operation, count);
-
-            Execute(command_list, operation, pid_table, pid_length, inputfd, outputfd, errorfd);            
-            ClosePipefd(pipefd, pipe_amount); //close pipe 父程序才需要，因為子程序早就 exit 了
-
-        }
-    }
-}
-*/
 
 //將輸入 input ，做切割，丟進 command_buffer 這個 buffer
 void Splitcmd(char *input, CommandBuffer &command_buffer) {
@@ -462,89 +410,6 @@ void Get_StdIOfd(Pipefd_table pipefd[], int &pipe_amount, int cli_sockfd, Parsed
 
 }
 
-/*
-// 如果是 number pipe 才需要 close 前面的
-int GetInputfd(Pipefd_table pipefd[], int pipe_amount){
-
-    for (int i = 0; i < pipe_amount; ++i) {
-
-        // 遇到到期的 pipe 就要去解決，包括 ordinary pipe;。
-        if (pipefd[i].count == 0 && pipefd[i].to_next == false) {
-
-            close(pipefd[i].fd[1]);
-            pipefd[i].fd[1] = -1;
-
-            return pipefd[i].fd[0];
-
-        }
-    }
-
-    return STDIN_FILENO; //對 ordinary pipe 而言，因為與前面指令一起看，i.e. ls | 所以當然其 stdin 仍為 STDIN_FILENO
-
-}
-
-int GetOutputfd(Pipefd_table pipefd[], int &pipe_amount, int operation, int count, ParsedCommand command_list) {
-    
-    if (operation == NUMBER_PIPE || operation == NUMBER_PIPE_ERR) 
-    {
-
-        for (int i = 0; i < pipe_amount; ++i) {
-
-            // use same count pipe which has used
-            if (pipefd[i].count == count && pipefd[i].to_next == false) {
-
-                return pipefd[i].fd[1];
-
-            }
-        }
-
-        CreatePipefd(pipefd, pipe_amount, count, false);
-        return pipefd[pipe_amount - 1].fd[1];
-
-    } 
-    else if (operation == ORDINARY_PIPE) 
-    {
-
-        CreatePipefd(pipefd, pipe_amount, count, true);
-        return pipefd[pipe_amount - 1].fd[1]; //pipe 的左端(寫入pipe那端)，是pipe的尾巴。
-
-    } 
-    else if (operation == FILE_REDIRECTION) 
-    {
-
-        int fd = open(command_list.filename, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-        //檔案需要有 r 權限 與 x 權限
-        return fd;
-
-    }
-    
-    return STDOUT_FILENO;
-
-}
-
-int GetErrorfd(Pipefd_table pipefd[], int &pipe_amount, int operation, int count) {
-
-    if (operation == NUMBER_PIPE_ERR) {
-
-        for (int i = 0; i < pipe_amount; ++i) {
-
-            if (pipefd[i].count == count && pipefd[i].to_next == false) {
-
-                return pipefd[i].fd[1];
-
-            }
-        }
-
-        CreatePipefd(pipefd, pipe_amount, count, false);
-        return pipefd[pipe_amount - 1].fd[1];
-
-    }
-    
-    return STDERR_FILENO;
-
-}
-
-*/
 
 void ChildHandler(int signo) {
     
@@ -556,9 +421,44 @@ void ChildHandler(int signo) {
 
 }
 
+bool IsBuildInCmd(CommandBuffer command_buffer, EnvTable &env, int sockfd) {
+
+    if (!strcmp(command_buffer.commands[0], "setenv")) {
+        for (int i = 0; i < env.length; ++i) {
+            if (!strcmp(env.key[i], command_buffer.commands[1])) {
+                strcpy(env.value[i], command_buffer.commands[2]);
+                setenv(env.key[i], env.value[i], 1);
+                return true;
+            }
+        }
+        strcpy(env.key[env.length], command_buffer.commands[1]);
+        strcpy(env.value[env.length], command_buffer.commands[2]);
+        env.length++;
+        return true;
+
+    } else if (!strcmp(command_buffer.commands[0], "printenv")) {
+        for (int i = 0; i < env.length; ++i) {
+            if (!strcmp(env.key[i], command_buffer.commands[1])) {
+                write(sockfd, env.value[i], strlen(env.value[i]));
+                write(sockfd, "\n", strlen("\n"));
+                return true;
+            }
+        }
+        char *myenv = getenv(command_buffer.commands[1]);
+        if (myenv) {
+            write(sockfd, myenv, strlen(myenv));
+        }
+        write(sockfd, "\n", strlen("\n"));
+        return true;
+    }
+
+    return false;
+}
+
 // 先確定 operation 是否上下正確
 void Exe_cmd(ParsedCommand command_list, pid_t pid_table[], int &pid_length, int stdIOfd[], int cli_sockfd, EnvTable &env){
     
+    /*
     if (!strcmp(command_list.argv[0], "setenv")) {
 
         setenv(command_list.argv[1], command_list.argv[2], 1);
@@ -576,11 +476,12 @@ void Exe_cmd(ParsedCommand command_list, pid_t pid_table[], int &pid_length, int
         }
 
     } 
+    
     else //unknown 與 一般指令 還須作判斷
     {
-        
+    */ 
         bool is_unknown = true;
-        char myenv[MAX_CMD_LEN];
+        char myenv[MAX_CMD_LEN] = {};
         strcpy(myenv, env.value[0]);
         char delim[] = ":";
         char *pch = strtok(myenv, delim);
@@ -674,6 +575,6 @@ void Exe_cmd(ParsedCommand command_list, pid_t pid_table[], int &pid_length, int
                 // 遇到 pipe ，父程序就先不用等“當下”這個子process處理完，因為還有後面幾個也要執行。
             }
         }
-    }
+    //}
 }
 

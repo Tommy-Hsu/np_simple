@@ -187,13 +187,15 @@ int main(int argc, char *argv[]){
                 command_buffer.length = 0; //當 command buffer 執行完該執行的後，需要將 buffer 清空，這裡用覆蓋的方式。
                 
                 do {
+                    memset(&read_buffer, '\0', sizeof(read_buffer));
                     read(sockfd, read_buffer, sizeof(read_buffer));
+                    strcat(input, read_buffer);
+
                 } while (read_buffer[strlen(read_buffer) - 1] != '\n');
 
-                strcat(input, read_buffer);
                 strtok(input, "\r\n");
-                Splitcmd(input,command_buffer);
                 strcpy(raw_command, input); //回報錯誤訊息
+                Splitcmd(input,command_buffer);
 
                 if (command_buffer.length == 0)
                     continue;
@@ -429,28 +431,40 @@ bool IsBuildInCmd(int sockfd, CommandBuffer command_buffer) {
     } else if (!strcmp(command_buffer.commands[0], "printenv")) {
 
         int idx = GetUserIndex(sockfd);
+        int have_not_pri = true;
         for (int i = 0; i < users[idx].env.amount; ++i) {
             if (!strcmp(command_buffer.commands[1], users[idx].env.key[i])) {
                 write(sockfd, users[idx].env.value[i], strlen(users[idx].env.value[i]));
                 write(sockfd, "\n", strlen("\n"));
+                have_not_pri = false;
+                break;
             }
         }
-        char *env = getenv(command_buffer.commands[1]);
-        write(sockfd, env, strlen(env));
-        write(sockfd, "\n", strlen("\n"));
+        if(have_not_pri){
+            char *env = getenv(command_buffer.commands[1]);
+            write(sockfd, env, strlen(env));
+            write(sockfd, "\n", strlen("\n"));
+        }
+
+        cout<<"";
 
     } else if (!strcmp(command_buffer.commands[0], "setenv")) {
 
         int idx = GetUserIndex(sockfd);
+        int have_not_writen = true;
         for (int i = 0; i < users[idx].env.amount; ++i) {
             if (!strcmp(command_buffer.commands[1], users[idx].env.key[i])) {
                 strcpy(users[idx].env.value[i], command_buffer.commands[2]);
+                have_not_writen = false;
+                break;
             }
         }
 
-        strcpy(users[idx].env.key[users[idx].env.amount], command_buffer.commands[1]);
-        strcpy(users[idx].env.value[users[idx].env.amount], command_buffer.commands[2]);
-        users[idx].env.amount++;
+        if(have_not_writen){
+            strcpy(users[idx].env.key[users[idx].env.amount], command_buffer.commands[1]);
+            strcpy(users[idx].env.value[users[idx].env.amount], command_buffer.commands[2]);
+            users[idx].env.amount++;
+        }
 
     } else {
         return false;
