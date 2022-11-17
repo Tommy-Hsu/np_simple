@@ -52,6 +52,7 @@ struct FIFOInfo {
 };
 
 // global server variable
+// 目前看來，共享記憶體是一個已經選定的區域，並且每次連結寫入會覆蓋上次操作的，不過要斷開
 int g_shmid_cli = 0;
 int g_shmid_msg = 0;
 int g_shmid_fifo = 0;
@@ -210,6 +211,7 @@ vector<string> Shell::Split(string s, string delimiter) {
     return res;
 }
 
+// cout env
 void Shell::PrintEnv(string var) {
     char* val = getenv(var.c_str());
     if (val != NULL) {
@@ -217,22 +219,28 @@ void Shell::PrintEnv(string var) {
     }
 }
 
+// 連動 shm_cli 並 loop 出每個
 void Shell::Who(void) {
     int temp_id = 0;
     Client_info* shm_cli;
-    Client_info* cur_cli = GetClientByID(cur_id, shm_cli);
+    Client_info* cur_cli = GetClientByID(cur_id, shm_cli); //shm_cli 是誰都不重要，此函式固定呼叫 g_shmid_cli
 
     cout << "<ID>\t" << "<nickname>\t" << "<IP:port>\t"<<"<indicate me>"<< endl;
 
-    for (size_t id = 0; id < MAX_USER; ++id) {
-        if (GetClientByID(id + 1, shm_cli) != NULL) {
+    for (size_t id = 0; id < MAX_USER; ++id) 
+    {
+        if (GetClientByID(id + 1, shm_cli) != NULL) // 把所有存在的人叫出
+        {
             temp_id = id + 1;
             Client_info* temp = GetClientByID(temp_id, shm_cli);
             cout << temp->id << "\t" << temp->user_name << "\t" << temp->user_ip << ":" << temp->port;
 
-            if (temp_id == cur_cli->id) {
+            if (temp_id == cur_cli->id) 
+            {
                 cout << "\t" << "<-me" << endl;
-            } else {
+            } 
+            else 
+            {
                 cout << "\t" << endl;
             }
         }
@@ -240,24 +248,35 @@ void Shell::Who(void) {
     shmdt(shm_cli);
 }
 
+// 呼叫 broadcast
 void Shell::Yell(string msg) {
     Broadcast("yell", msg, cur_id, -1);
 }
 
+// tell 只會去 broadcastone 
 void Shell::Tell(int target_id, string msg) {
+
+    // attach to  shared memory
     Client_info* shm_cli = GetCliSHM(g_shmid_cli);
-    if(shm_cli[target_id-1].valid != 0) {
+    if(shm_cli[target_id-1].valid != 0) 
+    {
         BroadcastOne("tell", msg, cur_id, target_id);
-    } else {
+    } 
+    else 
+    {
         cerr << "*** Error: user #" << to_string(target_id) << " does not exist yet. ***" << endl;
     }
     shmdt(shm_cli);
 }
 
+// 外面會傳入目標，先判斷有無用過，再去更改
 void Shell::Name(string name) {
+
     Client_info* shm_cli = GetCliSHM(g_shmid_cli);
-    for (size_t i = 0; i < MAX_USER; ++i) {
-        if (shm_cli[i].user_name == name) {
+    for (size_t i = 0; i < MAX_USER; ++i) 
+    {
+        if (shm_cli[i].user_name == name) 
+        {
             cout << "*** User '" + name + "' already exists. ***" << endl;
             return;
         }
@@ -284,13 +303,13 @@ int Shell::ExecCmds() {
 
     // store arguments
     bool is_first_argv = true;
-    bool is_final_argv = false;
+    bool is_final_argv = false; // 去做事
     string prog;
     vector<string> arguments;
 
     // pid
     bool is_using_pipe = false;
-    bool line_ends = false;
+    bool line_ends = false; // 真正判斷一行結束
     bool is_in_redirect = false;
     int in_fd = STDIN_FILENO;
     int out_fd = STDOUT_FILENO;
@@ -301,108 +320,136 @@ int Shell::ExecCmds() {
     bool is_in_userpipe = false;
 
     // client broadcast msg and setup userpipe
-    int source_id = -1;
-    int target_id = -1;
+    int source_id = -1; //代表有從其他地方 source 接受到 userpipe 的資訊
+    int target_id = -1; //有發送到其他地方 target 資訊，使用 userpipe
 
     // client broadcast msg
     int recv_str_id = -1;
     int send_str_id = -1;
 
 
-    // cmds_ 就是對一個 queue 的操作
+    // cmds_ 就是一個 shell 內的 queue 並對他操作
+    // 剛開始讀取指令，啥都不知道，因此所有條件初始為 false
+    // 在 parse_ags 已經將 input 分成 strings 放入 cmds_
+    // 此處操作 cmds_ 會隨之變動
     while (!cmds_.empty()) {
         
-        // init fd
+        // 初始 fd，可發現前面都還沒初始
         if (!is_in_redirect && !is_in_userpipe) {
             in_fd = STDIN_FILENO;
             out_fd = STDOUT_FILENO;
             err_fd = STDERR_FILENO;
         }
 
-        if (is_first_argv) {
+        // 初始接受指令
+        if (is_first_argv) 
+        {
             prog = cmds_.front();
             cmds_.pop();
             arguments.clear();
             arguments.push_back(prog);
             
-            if (prog == "tell" || prog == "yell") {
-                while (!cmds_.empty()) {
+            if (prog == "tell" || prog == "yell") 
+            {
+
+                while (!cmds_.empty()) 
+                {
                     arguments.push_back(cmds_.front());
                     cmds_.pop();
                 }
             }
 
             is_first_argv = false;
-            is_final_argv = IsQueueEmpty(cmds_);
-            is_using_pipe = false;
+            is_final_argv = IsQueueEmpty(cmds_); // ls
+            is_using_pipe = false; // 第一個指令還無法判斷
             if (cmds_.empty()) {
                 line_ends = true;
             }
-        } else {
-            // normal & error pipe
-            if (cmds_.front().find('|') != string::npos || cmds_.front().find('!') != string::npos) {
+        } 
+        else // 處理不是第一個指令參數，像是 target_id,is_using_pipe 等等，主要修改 in_fd, out_fd 的問題
+        {
+            if (cmds_.front().find('|') != string::npos || cmds_.front().find('!') != string::npos) // normal & error pipe
+            {
                 int pipe_num;
                 char pipe_char[5];
                 
-                // simple pipe
-                if (cmds_.front().length() == 1) {
+                if (cmds_.front().length() == 1) // simple pipe，cmds_ 還未 pop 出來
+                {
                     pipe_num = 1;
-                // numbered-pipe
-                } else {
-                    for (int i = 1; i < (int)cmds_.front().length(); ++i) {
+                } 
+                else // numbered-pipe
+                {
+                    for (int i = 1; i < (int)cmds_.front().length(); ++i) // chars to int
+                    {
                         pipe_char[i-1] = cmds_.front()[i];
                         pipe_char[i] = '\0';
                     }
                     pipe_num = atoi(pipe_char);
                 }
 
-                CreatePipe(pipe_vector_, pipe_num, out_fd);
+                // 知道動作，且現在的 out_fd，就是 pipe 的 in_fd 一定是後面那個參數
+                // 獲得 out_fd 
+                CreatePipe(pipe_vector_, pipe_num, out_fd); 
 
-                if (cmds_.front().find('!') != string::npos) {
+                if (cmds_.front().find('!') != string::npos) 
+                {
                     err_fd = out_fd;
                 }
 
                 is_first_argv = true;
                 is_final_argv = true;
                 is_using_pipe = true;
-                if (cmds_.empty()) {
+                if (cmds_.empty()) 
+                {
                     line_ends = true;
                 }
-                cmds_.pop();
-            // redirection > & <
-            } else if (cmds_.front() == ">" || cmds_.front() == "<") {
+                cmds_.pop(); // 符號 pop 掉
+            } 
+            else if (cmds_.front() == ">" || cmds_.front() == "<") // redirection > & <
+            {
                 string op = cmds_.front();
-                cmds_.pop();
+                cmds_.pop(); // 將指令 pop 出去
 
                 int file_fd;
-                if (op == ">") {
-                    file_fd = open(cmds_.front().c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-                } else {
+                if (op == ">") 
+                {
+                    file_fd = open(cmds_.front().c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR); 
+                } 
+                else // op == "<"
+                {
                     file_fd = open(cmds_.front().c_str(), O_RDONLY, 0644);
                 }
-                if (file_fd < 0) {
+
+                if (file_fd < 0) 
+                {
                     cerr << "open file error" << endl;
                 }
-                cmds_.pop();
+                cmds_.pop(); // 將 destination file pop 出去，因為 source file 已經在前面解析過了
 
-                if (op == ">") {
+                if (op == ">") 
+                {
                     out_fd = file_fd;
-                } else {
+                } 
+                else // op == "<"
+                {
                     in_fd = file_fd;
                 }
                 
                 is_using_pipe = false;
                 is_in_redirect = true;
-                if (cmds_.empty()) {
+                if (cmds_.empty()) 
+                {
                     line_ends = true;
                     is_first_argv = true;
                     is_final_argv = true;
                 }
-            // named pipe (out), ex: >2
-            } else if ((cmds_.front().find('>') != string::npos) && (cmds_.front() != ">")) {
+            } 
+            else if ((cmds_.front().find('>') != string::npos) && (cmds_.front() != ">")) // named pipe (out), ex: >2
+            {
                 char user_char[3];
 
-                for (int i = 1; i < (int)cmds_.front().length(); ++i) {
+                for (int i = 1; i < (int)cmds_.front().length(); ++i) 
+                {
                     user_char[i-1] = cmds_.front()[i];
                     user_char[i] = '\0';
                 }
@@ -410,21 +457,23 @@ int Shell::ExecCmds() {
                 target_id = atoi(user_char);
                 Client_info* shm_cli;
 
-                // target id not exist
-                if (GetClientByID(target_id, shm_cli) == NULL) {
+                if (GetClientByID(target_id, shm_cli) == NULL)  // target id not exist
+                {
                     cmds_.pop();
                     
                     cout << "*** Error: user #" << target_id << " does not exist yet. ***" << endl;
                     target_id = -1;
                     
                     queue<string> empty;
-                    swap(cmds_, empty);
+                    swap(cmds_, empty); // 後面是啥都不重要了
                     return 0;
-                // target id exists
-                } else {
+                } 
+                else   // target id exists
+                {
                     // check if user pipe already exists
                     FIFOInfo* shm_fifo = GetFIFOSHM(g_shmid_fifo);
-                    if (shm_fifo->fifo[cur_id-1][target_id-1].in_fd != -1) {
+                    if (shm_fifo->fifo[cur_id-1][target_id-1].in_fd != -1) // 雖然需要檢查 in_fd & out_fd 但主要是靠[cur_id -1 ][target_id]
+                    {
                         cout << "*** Error: the pipe #" << cur_id << "->#" << target_id;
                         cout << " already exists. ***" << endl;
                         
@@ -435,30 +484,35 @@ int Shell::ExecCmds() {
                     shmdt(shm_fifo);
 
                     // mkFIFO and record FIFOname
+                    // 寫入 fifo 是 execcmd 的部分
                     CreateUserPipe(cur_id, target_id, out_fd);
                     is_using_pipe = true;
                     is_in_userpipe = true;
                     cmds_.pop();
-                    if (cmds_.empty()) {
+                    if (cmds_.empty()) 
+                    {
                         line_ends = true;
                         is_first_argv = true;
                         is_final_argv = true;
                     }
                     send_str_id = target_id;
                 }
-            // named pipe (in), ex: <2
-            } else if ((cmds_.front().find('<') != string::npos) && (cmds_.front() != "<")) {
+            } 
+            else if ((cmds_.front().find('<') != string::npos) && (cmds_.front() != "<")) // named pipe (in), ex: <2
+            {
                 char user_char[3];
 
-                for (int i = 1; i < (int)cmds_.front().length(); ++i) {
+                for (int i = 1; i < (int)cmds_.front().length(); ++i) 
+                {
                     user_char[i-1] = cmds_.front()[i];
                     user_char[i] = '\0';
                 }
 
                 source_id = atoi(user_char);
                 Client_info* shm_cli;
-                // target id does not exist
-                if (GetClientByID(source_id, shm_cli) == NULL) {
+                
+                if (GetClientByID(source_id, shm_cli) == NULL) // target id does not exist
+                {
                     cmds_.pop();
 
                     cout << "*** Error: user #" << source_id << " does not exist yet. ***" << endl;
@@ -467,11 +521,13 @@ int Shell::ExecCmds() {
                     queue<string> empty;
                     swap(cmds_, empty);
                     return 0;
-                // target id exists
-                } else {
+                } 
+                else // target id exists
+                {
                     // check if user pipe already exists
                     FIFOInfo* shm_fifo = GetFIFOSHM(g_shmid_fifo);
-                    if (shm_fifo->fifo[source_id-1][cur_id-1].out_fd == -1) {
+                    if (shm_fifo->fifo[source_id-1][cur_id-1].out_fd == -1) 
+                    {
                         // cannot find any userpipe's target id is current client id
                         cout << "*** Error: the pipe #" << source_id << "->#" << cur_id;
                         cout << " does not exist yet. ***" << endl;
@@ -485,38 +541,49 @@ int Shell::ExecCmds() {
                     GetUserPipeFd(source_id, cur_id, in_fd);
                     is_in_userpipe = true;
                     cmds_.pop();
-                    if (cmds_.empty()) {
+                    if (cmds_.empty()) 
+                    {
                         line_ends = true;
                         is_first_argv = true;
                         is_final_argv = true;
                     }
                     recv_str_id = source_id;
                 }
-            } else {
+            } 
+            else // cat test.html, number test.html, removetag test.html
+            {
                 arguments.push_back(cmds_.front());
                 cmds_.pop();
                 is_final_argv = IsQueueEmpty(cmds_);
                 is_using_pipe = false;
-                if (cmds_.empty()) {
+                if (cmds_.empty()) 
+                {
                     line_ends = true;
                 }
             }
-
-        // execute
-        } if (is_final_argv) {
+        } 
+        
+        // 預設非最後指令，例如有，exit,yell,tell 則直接符合
+        // 同時也是真正 execute 的地方
+        if (is_final_argv) 
+        {
             // broadcast send and recv
-            if (recv_str_id != -1) {
+            if (recv_str_id != -1) 
+            {
                 string line_input = terminal_input_.substr(0, terminal_input_.length());
-                if (line_input.back()=='\r') {
+                if (line_input.back()=='\r') 
+                {
                     line_input.pop_back();
                 }
                 recv_str_id = -1;
                 Broadcast("recv", line_input, cur_id, source_id);
                 usleep(500);
             }
-            if (send_str_id != -1) {
+            if (send_str_id != -1) 
+            {
                 string line_input = terminal_input_.substr(0, terminal_input_.length());
-                if (line_input.back()=='\r') {
+                if (line_input.back()=='\r') 
+                {
                     line_input.pop_back();
                 }
                 send_str_id = -1;
@@ -525,21 +592,36 @@ int Shell::ExecCmds() {
             }
             
             // pipe: get pipe (count == 0)
+            // 是否有需要結束的 pipe 做處理
             bool need_close_pipe = GetPipeFd(pipe_vector_, in_fd);
 
             // execute
+            // 若是 yell, tell 會把後面所有東西放入 arguments
+            // 並且也是等所有東西都備齊後，才去真正執行
+            // 也因此會在 is_final_argv 執行
+            // 分出 child 和 parent
+            // 若是 build-in 指令會相當方便，直接跳到 is_final_argv
             status = ExecCmd(arguments, IsExecutable(prog, path_vector_), in_fd, out_fd, err_fd, line_ends, is_using_pipe, target_id);
 
-            // pipe
+            // execcmd 已經有做完事情了，pipe 可以消除，並做 countdown
+            // need_close_pipe 是從 process 這邊關掉自己的 fd，而 erasedpipefd 則是從 pipe_vector 那邊去關閉
             ErasePipefd(pipe_vector_);
             CountdownPipefd(pipe_vector_);
-            if (need_close_pipe) {
+
+            // 別人將資料進到我這邊，視為我的 in_fd，
+            // 所以要關閉當然是關閉 pipe 的輸出，也就是我的輸入
+            if (need_close_pipe) 
+            {
                 close(in_fd);
             }
             if (target_id > 0) {
                 target_id = -1;
             }
+
             // if userpipe in , then erase
+            // 代表由從其他地方 source 接受到 userpipe 的資訊
+            // 這裡已經是執行完程式了
+            // 當然會需要關掉 userpipe 啦
             if (source_id > 0) {
                 EraseUserPipe(source_id);
                 source_id = -1;
@@ -553,58 +635,82 @@ int Shell::ExecCmds() {
     return status;
 }
 
+// 或許用不著成為一個函式，但會方便許多
 bool Shell::IsQueueEmpty(queue<string> cmds) {
+
     if (cmds.empty()) return true;
     return false;
+
 }
 
+// 某些參數由哪些指令影響，還需釐清
 int Shell::ExecCmd(vector<string> &arguments, bool is_executable, int in_fd, int out_fd, int err_fd, bool line_ends, bool is_using_pipe, int target_id) {
+
+    // args 做操作，arguments 其實不會被操作到
     char *args[arguments.size() + 1];
-    for (size_t i = 0; i < arguments.size(); ++i) {
+    for (size_t i = 0; i < arguments.size(); ++i) 
+    {
         args[i] = new char[arguments[i].size() + 1];
         strcpy(args[i], arguments[i].c_str());
     }
 
     // built-in
+    // 將 char array args[0] 弄為 string prog
     string prog(args[0]);
-    if (prog == "printenv") {
+    if (prog == "printenv") 
+    {
         PrintEnv(args[1]);
         return 0;
-    } else if (prog == "setenv") {
+    } 
+    else if (prog == "setenv") 
+    {
         SetEnv(args[1], args[2]);
         return 0;
-    } else if (prog == "who") {
+    } 
+    else if (prog == "who") 
+    {
         Who();
         return 0;
-    } else if (prog == "yell") {
+    } 
+    else if (prog == "yell") 
+    {
         string msg = "";
 
-        for (size_t i = 1; i < arguments.size(); ++i) {
+        for (size_t i = 1; i < arguments.size(); ++i) //args[0] 為指令，因此從 1 開始
+        {
             msg += string(args[i]) + " ";
         }
 
-        msg.pop_back();
+        msg.pop_back(); //最後的空格
         Yell(msg);
         return 0;
-    } else if (prog == "tell") {
+    } 
+    else if (prog == "tell") 
+    {
         string msg = "";
 
-        for (size_t i = 2; i < arguments.size(); ++i) {
+        for (size_t i = 2; i < arguments.size(); ++i) // 參數 2 為 receiver 
+        {
             msg += string(args[i]) + " ";
         }
 
         msg.pop_back();
-        Tell(stoi(args[1]), msg);
+        Tell(stoi(args[1]), msg); //已經在 cur_id 因此只需接受者的資訊
         return 0;
-    } else if (prog == "name") {
-        Name(string(args[1]));
+    } 
+    else if (prog == "name") 
+    {
+        Name(string(args[1])); 
         return 0;
-    } else if (prog == "exit") {
-        return -1;
+    } 
+    else if (prog == "exit") {
+        return -1; 
+        // shell return -1 ，代表結束
+        // shell return 其他則沒事，繼續接受 input
     }
 
     // not built-in
-    signal(SIGCHLD, ChildHandler);
+    signal(SIGCHLD, ChildHandler);// 如果 child 先完成，則需要先等 parent，使用 waitpid
     pid_t child_pid;
     child_pid = fork();
     while (child_pid < 0) {
@@ -612,31 +718,40 @@ int Shell::ExecCmd(vector<string> &arguments, bool is_executable, int in_fd, int
         child_pid = fork();
     }
 
-    // child process
-    if (child_pid == 0) {
-        // current client open FIFO and record write fd
-        if (target_id > 0) {
+    // slave_child process
+    if (child_pid == 0) 
+    {
+        // 有東西要送，因此需要對 stdoutfd 做修改，current client open FIFO and record write fd
+        if (target_id > 0) 
+        {
             SetUserPipeOut(target_id, out_fd);
         }
 
         // pipe ops
         ConnectPipeFd(in_fd, out_fd, err_fd);
-        if (!is_executable) {
+        if (!is_executable) 
+        {
             cerr << "Unknown command: [" << args[0] << "]." << endl;
             exit(0);
-        } else {
+        } 
+        else 
+        {
             args[arguments.size()] = NULL;
-            if(execvp(args[0], args) < 0) {
+            if(execvp(args[0], args) < 0) 
+            {
                 cerr << "execl error" << endl;
                 exit(0);
             }
             cerr << "execvp" << endl;
             exit(0);
         }
-    // parent process
-    } else {
-        if (line_ends) {
-            if (!is_using_pipe) {
+    } 
+    else  // slave_parent process
+    {
+        if (line_ends) // 執行前傳過來的,某些情況會使得執行時不為最後，例如
+        {
+            if (!is_using_pipe) // 也沒有 使用 pipe 
+            {
                 int status;
                 waitpid(child_pid, &status, 0);
             }
@@ -645,12 +760,15 @@ int Shell::ExecCmd(vector<string> &arguments, bool is_executable, int in_fd, int
     return 0;
 }
 
+// 可否執行，直接是內建指令，或是可以由路徑找到執行檔
 bool Shell::IsExecutable(string prog, vector<string> &path_vector_) {
+
     if (prog == "printenv" || prog == "setenv" || prog == "exit" ||
         prog == "who" || prog == "tell" || prog == "yell" || prog == "name") {
         return true;
     }
 
+    // 搜尋可執行檔
     bool is_executable;
     string path;
     vector<string>::iterator iter = path_vector_.begin();
@@ -666,66 +784,89 @@ bool Shell::IsExecutable(string prog, vector<string> &path_vector_) {
     return false;
 }
 
+// 主要判斷有沒有人需要共用 pipe
+// 不然就新建一個
 void Shell::CreatePipe(vector<PipeFd> &pipe_vector_, int pipe_num, int &in_fd) {
+
     // check if pipe to same pipe
     // has same pipe => reuse old pipe (multiple write, one read)
     // no same pipe => create new pipe (one write, one read)
     bool has_same_pipe = false;
 
     vector<PipeFd>::iterator iter = pipe_vector_.begin();
-    while(iter != pipe_vector_.end()) {
-        if ((*iter).count == pipe_num) {
+    while(iter != pipe_vector_.end()) 
+    {
+        if ((*iter).count == pipe_num)  // 遇到同樣要寫入別地方的 number pipe
+        {
             has_same_pipe = true;
             in_fd = (*iter).in_fd;
         }
         ++iter;
     }
 
-    if (has_same_pipe) {
+    if (has_same_pipe) //同樣管子，就不用再新建了
+    {
         return;
     }
 
     // create pipe
     int pipe_fd[2];
-    if (pipe(pipe_fd) < 0) {
+    if (pipe(pipe_fd) < 0) 
+    {
         cerr << "pipe error" << endl;
         exit(0);
     }
+    
     PipeFd new_pipefd;
     new_pipefd.in_fd = pipe_fd[1];  // write fd
     new_pipefd.out_fd = pipe_fd[0];  // read fd
     new_pipefd.count = pipe_num;
     pipe_vector_.push_back(new_pipefd);
-    in_fd = pipe_fd[1];
+
+    // 現在這個 process 的 out_fd，就是這裡要寫入 pipe 的 write_fd
+    // 也就是將 process 的 out_fd 改寫成獲得的 pipe_fd
+    in_fd = pipe_fd[1]; 
 }
 
+// 將 pipefd 之 count 做 countdown
 void Shell::CountdownPipefd(vector<PipeFd> &pipe_vector_) {
+
     vector<PipeFd>::iterator iter = pipe_vector_.begin();
-    while (iter != pipe_vector_.end()) {
+    while (iter != pipe_vector_.end()) 
+    {
         --(*iter).count;
         ++iter;
     }
 }
 
+// 解除一般 pipe 的資訊
 void Shell::ErasePipefd(vector<PipeFd> &pipe_vector_) {
+
     vector<PipeFd>::iterator iter = pipe_vector_.begin();
     while (iter != pipe_vector_.end()) {
-        if ((*iter).count == 0) {
+        if ((*iter).count == 0) 
+        {
             close((*iter).in_fd);
             close((*iter).out_fd);
             pipe_vector_.erase(iter);
-        } else {
+        } 
+        else 
+        {
             ++iter;
         }
     }
 }
 
+// 判斷是否有到期的 pipe
 bool Shell::GetPipeFd(vector<PipeFd> &pipe_vector_, int& in_fd) {
+
     vector<PipeFd>::iterator iter = pipe_vector_.begin();
-    while (iter != pipe_vector_.end()) {
-        if ((*iter).count == 0) {
+    while (iter != pipe_vector_.end()) 
+    {
+        if ((*iter).count == 0)  // *iter 為 vector 中其中一份 pipefd
+        {
             close((*iter).in_fd);
-            in_fd = (*iter).out_fd;
+            in_fd = (*iter).out_fd; // ?
             return true;
         }
         ++iter;
@@ -733,7 +874,10 @@ bool Shell::GetPipeFd(vector<PipeFd> &pipe_vector_, int& in_fd) {
     return false;
 }
 
+// 因為 fd 都設置好了，
+// 只需要將 stdIOfd 改為 我們要的 fd
 void Shell::ConnectPipeFd(int in_fd, int out_fd, int err_fd) {
+
     if (in_fd != STDIN_FILENO) {
         dup2(in_fd, STDIN_FILENO);
     }
@@ -754,19 +898,24 @@ void Shell::ConnectPipeFd(int in_fd, int out_fd, int err_fd) {
     }
 }
 
+// 小孩需等父母回收
 void Shell::ChildHandler(int signo) {
     int status;
     while (waitpid(-1, &status, WNOHANG) > 0) {}
 }
 
+// 使用 mkfifio 建立，並立即通知 target id 接受
 void Shell::CreateUserPipe(int cur_id, int target_id, int &out_fd) {
+    
     char fifopath[MAX_PATH_SIZE];
     sprintf(fifopath, "%suser_pipe_%d_%d", FIFO_PATH, cur_id, target_id);
     
-    if (mkfifo(fifopath, 0666 | S_IFIFO) < 0) {
+    if (mkfifo(fifopath, 0666 | S_IFIFO) < 0) 
+    {
         cerr << "mkfifo error" << endl;
         exit(0);
     }
+
     Client_info* shm_cli = GetCliSHM(g_shmid_cli);
     Client_info* target_cli = GetClientByID(target_id, shm_cli);
     FIFOInfo* shm_fifo = GetFIFOSHM(g_shmid_fifo);
@@ -778,20 +927,30 @@ void Shell::CreateUserPipe(int cur_id, int target_id, int &out_fd) {
     shmdt(shm_fifo);
 }
 
+// ?
+// 設定 user_pipe，這次是額外將 user_pipe 設定在外面資料夾
+// 因為讀取指令時，當然知道當下的
+// 這裡的 target_id 是 userpipe_target_id
+// create 的時候沒有設
 void Shell::SetUserPipeOut(int target_id, int& out_fd) {
+
     char fifopath[MAX_PATH_SIZE];
     sprintf(fifopath, "%suser_pipe_%d_%d", FIFO_PATH, cur_id, target_id);
+
     Client_info* shm_cli = GetCliSHM(g_shmid_cli);
     FIFOInfo* shm_fifo = GetFIFOSHM(g_shmid_fifo);
 
     out_fd = open(fifopath, O_WRONLY);
-    shm_fifo->fifo[cur_id-1][target_id-1].in_fd = out_fd;
+    shm_fifo->fifo[cur_id-1][target_id-1].in_fd = out_fd; // 現在這個程序的 input 就是接受由
 
     shmdt(shm_cli);
     shmdt(shm_fifo);
 }
 
+// 只是獲得 id，並未真正從 fifo 讀取
+// 真正讀取是從 execcmd 那邊
 void Shell::GetUserPipeFd(int source_id, int cur_id, int& in_fd) {
+    
     char fifopath[MAX_PATH_SIZE];
     sprintf(fifopath, "%suser_pipe_%d_%d", FIFO_PATH, source_id, cur_id);
     Client_info* shm_cli = GetCliSHM(g_shmid_cli);
@@ -805,10 +964,13 @@ void Shell::GetUserPipeFd(int source_id, int cur_id, int& in_fd) {
     shmdt(shm_fifo);
 }
 
+// 使用完 user_pipe
 void Shell::EraseUserPipe(int id) {
+
     FIFOInfo* shm_fifo = GetFIFOSHM(g_shmid_fifo);
 
-    if (shm_fifo->fifo[id-1][cur_id-1].is_used) {
+    if (shm_fifo->fifo[id-1][cur_id-1].is_used) 
+    {
         shm_fifo->fifo[id-1][cur_id-1].in_fd = -1;
         shm_fifo->fifo[id-1][cur_id-1].out_fd = -1;
         shm_fifo->fifo[id-1][cur_id-1].is_used = false;
@@ -918,6 +1080,8 @@ void Broadcast(string action, string msg, int cur_id, int target_id) {
     shmdt(shm_msg);
 }
 
+// 需要傳送訊息到個別，
+// 因此需要 msg_shm cli_shm
 void BroadcastOne(string action, string msg, int cur_id, int target_id) {
     string send_msg = "";
     Client_info* shm = GetCliSHM(g_shmid_cli);
@@ -934,7 +1098,7 @@ void BroadcastOne(string action, string msg, int cur_id, int target_id) {
     usleep(500);
 
     shm = GetCliSHM(g_shmid_cli);
-    kill(shm[target_id-1].pid, SIGUSR1);
+    kill(shm[target_id-1].pid, SIGUSR1); // 發送訊息的中斷訊號給目標
     shmdt(shm);
 }
 
@@ -1060,9 +1224,12 @@ int GetIDFromSHM() {
 // 先 attach 到 cli_shm 中
 // id 一樣且有人佔用，就可以回傳 cli_info
 Client_info* GetClientByID(int id, Client_info* shm_cli) {
+
     shm_cli = GetCliSHM(g_shmid_cli);
-	for (int i = 0; i < MAX_USER; ++i) {
-		if ((shm_cli[i].id == id) && (shm_cli[i].valid == 1)) {
+	for (int i = 0; i < MAX_USER; ++i) 
+    {
+		if ((shm_cli[i].id == id) && (shm_cli[i].valid == 1)) 
+        {
             Client_info* res = &shm_cli[i];
 			return res;
 		}
@@ -1092,10 +1259,11 @@ void SigHandler(int sig) {
     {
         FIFOInfo* shm_fifo = GetFIFOSHM(g_shmid_fifo);
 		int	i;
-		for (i = 0; i < MAX_USER; ++i) {
-			if (shm_fifo->fifo[i][cur_id-1].out_fd == -1 && shm_fifo->fifo[i][cur_id-1].name[0] != 0) //?
+		for (i = 0; i < MAX_USER; ++i) 
+        {
+			if (shm_fifo->fifo[i][cur_id-1].out_fd == -1 && shm_fifo->fifo[i][cur_id-1].name[0] != 0) // 不管從何者來的 fifo 都給我 且是要有名字的
             {
-                shm_fifo->fifo[i][cur_id-1].out_fd = open(shm_fifo->fifo[i][cur_id-1].name, O_RDONLY);
+                shm_fifo->fifo[i][cur_id-1].out_fd = open(shm_fifo->fifo[i][cur_id-1].name, O_RDONLY); // 雖然接收到中斷，但要主動 <2 才會真正成為 out_fd
             }
 		}
         shmdt(shm_fifo);
